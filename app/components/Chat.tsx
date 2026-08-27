@@ -184,20 +184,42 @@ export default function Chat() {
 
   const handleFeedback = (messageId: string, type: "up" | "down") => {
     if (!currentConvId) return;
+    const idx = messages.findIndex((m) => m.id === messageId);
+    if (idx === -1) return;
+
+    const message = messages[idx];
+    const newFeedback = message.feedback === type ? null : type;
+
     setConversations((prev) =>
       prev.map((c) =>
         c.id === currentConvId
           ? {
               ...c,
               messages: c.messages.map((m) =>
-                m.id === messageId
-                  ? { ...m, feedback: m.feedback === type ? null : type }
-                  : m
+                m.id === messageId ? { ...m, feedback: newFeedback } : m
               ),
             }
           : c
       )
     );
+
+    // Only log when a rating is actually being given, not when un-toggling
+    // one off. The prompt is the nearest preceding user message.
+    if (!newFeedback) return;
+    const promptMessage = messages
+      .slice(0, idx)
+      .reverse()
+      .find((m) => m.role === "user");
+
+    fetch("/api/feedback", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        prompt: promptMessage?.content ?? "",
+        response: message.content,
+        feedback: newFeedback,
+      }),
+    }).catch((error) => console.error("Failed to save feedback:", error));
   };
 
   const handleRegenerate = async (messageId: string) => {
