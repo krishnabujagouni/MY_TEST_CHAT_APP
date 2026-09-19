@@ -30,11 +30,12 @@ flowchart LR
 Without a PDF attached, `/api/chat` skips step 1 and asks Gemini directly.
 
 **Plain chat:** the browser posts the conversation to `/api/chat`, which calls Gemini
-and returns the reply.
+and streams the reply back word by word as it is generated.
 
 **Document question:** `/api/chat` sends the question verbatim to the Python service,
 which embeds it and searches Pinecone; the top pages are passed to Gemini as context,
-and the answer comes back with the page numbers it cites.
+and the answer streams back with the page numbers it cites (the pages appear as soon
+as the search finishes, before the answer starts).
 
 **Upload:** the PDF is proxied to the Python service, which extracts the text per page,
 embeds it and upserts it into Pinecone.

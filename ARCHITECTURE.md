@@ -44,8 +44,9 @@ Without a PDF attached, `/api/chat` skips step 1 and asks Gemini directly.
 2. On submit, the client posts `{ messages, model, generationConfig, docId? }` to `POST /api/chat`.
 3. The route keeps the model only if it is allow-listed, clamps every generation
    setting, and passes at most the 6 most recent earlier messages plus the question.
-4. Gemini is called through `@google/genai`; 503 ("high demand") is retried twice.
-5. The reply is returned as `{ text, sources: [], runId }`.
+4. Gemini is called through `@google/genai`; 503 ("high demand") is retried twice
+   (only before the first chunk has been sent to the browser).
+5. The reply is **streamed** back and rendered as it arrives — see below.
 
 **Document question**
 
@@ -58,6 +59,24 @@ Without a PDF attached, `/api/chat` skips step 1 and asks Gemini directly.
    "I don't know — the provided documents don't cover this."
 5. The reply carries `sources` (filename + page), which the UI shows under the answer.
    Sources are omitted when the model declines.
+
+**Streaming response format**
+
+`/api/chat` answers with newline-delimited JSON (`application/x-ndjson`), one event
+per line:
+
+| Event | When | Fields |
+| --- | --- | --- |
+| `meta` | once before the text (again if sources are withdrawn) | `runId`, `sources`, `docMissing?` |
+| `delta` | per chunk of generated text | `text` |
+| `error` | the request failed after the stream opened | `error` |
+
+Anything that fails *before* the stream opens (bad body, invalid `docId`, missing API
+key) is still a plain JSON error with a status code, so the client has one error path.
+The browser appends each `delta` to the assistant message in place; on Stop, whatever
+already arrived is kept. Answers that don't come from the model (search unavailable,
+document gone, "I don't know") are sent as a single `delta` so the client only handles
+one shape.
 
 **Upload**
 
@@ -79,7 +98,9 @@ Without a PDF attached, `/api/chat` skips step 1 and asks Gemini directly.
 - The client never talks to the Python service directly; it goes through `/api/rag/upload`
   and `/api/chat`.
 - Requests are cancellable: the Stop button aborts the fetch, and the route passes that
-  signal to both the Python search and Gemini.
+  signal to both the Python search and Gemini. Text that already streamed is kept.
+- The traced `chat` run stays open until the stream finishes, so LangSmith still records
+  the complete answer and the true end-to-end duration.
 - Trace inputs deliberately exclude the Gemini client object, PDF bytes and embedding
   vectors.
 

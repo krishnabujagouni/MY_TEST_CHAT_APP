@@ -130,12 +130,23 @@ export default function Chat() {
 
   const stopGenerating = () => abortControllerRef.current?.abort();
 
-  // Sends `history` (the full message list to send as context) to the API
-  // and returns the assistant's reply as a Message, or null if the user
-  // stopped it. Never throws.
-  const fetchAssistantReply = async (history: Message[]): Promise<Message | null> => {
+  // Sends `history` (the full message list to send as context) to the API and
+  // writes the reply into conversation `convId` as it streams in. Whatever
+  // arrived before a Stop is kept. Never throws.
+  const streamAssistantReply = async (convId: string, history: Message[]) => {
     const controller = new AbortController();
     abortControllerRef.current = controller;
+
+    // Mutated as events arrive; every redraw re-appends a copy of it to
+    // `history` so the same message updates instead of piling up.
+    const reply = createMessage("assistant", "");
+    const show = () =>
+      setConversations((prev) =>
+        prev.map((c) =>
+          c.id === convId ? { ...c, messages: [...history, { ...reply }] } : c
+        )
+      );
+
     try {
       const response = await fetch("/api/chat", {
         method: "POST",
@@ -149,20 +160,58 @@ export default function Chat() {
         signal: controller.signal,
       });
 
-      const data = await response.json();
-      if (!response.ok) {
+      // Anything that failed before the answer started is still plain JSON.
+      if (!response.ok || !response.body) {
+        const data = await response.json().catch(() => ({}));
         throw new Error(data.error || "Failed to fetch response");
       }
-      if (data.docMissing) setAttachedDoc(null);
-      return createMessage("assistant", data.text, data.sources ?? [], data.runId);
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let failure: string | null = null;
+
+      // Newline-delimited JSON; a network chunk can end mid-line, so the
+      // trailing fragment is carried over to the next read.
+      for (let done = false; !done; ) {
+        const result = await reader.read();
+        done = result.done;
+        buffer += decoder.decode(result.value ?? new Uint8Array(), { stream: !done });
+        const lines = buffer.split("\n");
+        buffer = done ? "" : (lines.pop() ?? "");
+
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          const event = JSON.parse(line);
+          if (event.type === "delta") {
+            reply.content += event.text;
+          } else if (event.type === "meta") {
+            reply.sources = event.sources ?? [];
+            reply.runId = event.runId;
+            if (event.docMissing) setAttachedDoc(null);
+          } else if (event.type === "error") {
+            failure = event.error;
+          }
+        }
+        // Not before there is text: until then the typing dots stand in.
+        if (lines.length > 0 && reply.content) show();
+      }
+
+      if (failure) throw new Error(failure);
     } catch (error) {
-      if (controller.signal.aborted) return null;
+      if (controller.signal.aborted) {
+        // Drop the placeholder if nothing had streamed yet.
+        if (!reply.content) {
+          setConversations((prev) =>
+            prev.map((c) => (c.id === convId ? { ...c, messages: history } : c))
+          );
+        }
+        return;
+      }
       console.error("Error:", error);
       const detail = error instanceof Error ? error.message : String(error);
-      return createMessage(
-        "assistant",
-        `Sorry, I encountered an error: ${detail}`
-      );
+      reply.content += `${reply.content ? "\n\n" : ""}Sorry, I encountered an error: ${detail}`;
+      show();
     } finally {
       if (abortControllerRef.current === controller) abortControllerRef.current = null;
     }
@@ -212,17 +261,7 @@ export default function Chat() {
     setInput("");
     setLoading(true);
 
-    const assistantMessage = await fetchAssistantReply(history);
-
-    if (assistantMessage) {
-      setConversations((prev) =>
-        prev.map((c) =>
-          c.id === convId
-            ? { ...c, messages: [...history, assistantMessage] }
-            : c
-        )
-      );
-    }
+    await streamAssistantReply(convId, history);
 
     if (priorMessages.length === 0) {
       const title =
@@ -300,17 +339,7 @@ export default function Chat() {
       prev.map((c) => (c.id === currentConvId ? { ...c, messages: history } : c))
     );
 
-    const assistantMessage = await fetchAssistantReply(history);
-
-    if (assistantMessage) {
-      setConversations((prev) =>
-        prev.map((c) =>
-          c.id === currentConvId
-            ? { ...c, messages: [...history, assistantMessage] }
-            : c
-        )
-      );
-    }
+    await streamAssistantReply(currentConvId, history);
     setLoading(false);
   };
 
@@ -339,17 +368,7 @@ export default function Chat() {
       prev.map((c) => (c.id === currentConvId ? { ...c, messages: history } : c))
     );
 
-    const assistantMessage = await fetchAssistantReply(history);
-
-    if (assistantMessage) {
-      setConversations((prev) =>
-        prev.map((c) =>
-          c.id === currentConvId
-            ? { ...c, messages: [...history, assistantMessage] }
-            : c
-        )
-      );
-    }
+    await streamAssistantReply(currentConvId, history);
     setLoading(false);
   };
 
@@ -644,7 +663,8 @@ export default function Chat() {
               );
             })}
 
-            {loading && (
+            {/* Once the first token arrives the reply itself is the indicator. */}
+            {loading && messages.at(-1)?.role === "user" && (
               <div className="flex gap-4 py-6 animate-in fade-in">
                 <div className="flex-shrink-0 w-8 h-8 rounded-full bg-gradient-to-br from-blue-400 to-blue-600 flex items-center justify-center text-white font-semibold text-lg">
                   🤖

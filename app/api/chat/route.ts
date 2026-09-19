@@ -37,18 +37,53 @@ const DEFAULT_MODEL = "gemini-3-flash-preview";
 const MAX_ATTEMPTS = 3;
 const RETRY_DELAYS_MS = [500, 1500];
 
-async function generateWithRetry(
+interface SourceRef {
+  filename: string;
+  page: number;
+}
+
+// Streamed to the browser as newline-delimited JSON: `meta` once before the
+// answer (and again if sources are withdrawn), then one `delta` per chunk.
+type ChatEvent =
+  | { type: "meta"; runId?: string; sources: SourceRef[]; docMissing?: boolean }
+  | { type: "delta"; text: string }
+  | { type: "error"; error: string };
+
+type Emit = (event: ChatEvent) => Promise<void>;
+
+// Streams Gemini's answer, emitting each chunk as it arrives, and returns the
+// full text once it is done. Retrying is only safe before the first chunk is
+// emitted — after that the browser already has a partial answer that a second
+// attempt would duplicate.
+async function streamAnswer(
   ai: GoogleGenAI,
   model: string,
   contents: Content[],
-  config: GenerateContentConfig
-) {
+  config: GenerateContentConfig,
+  emit: Emit
+): Promise<string> {
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    let streamed = false;
     try {
-      return await ai.models.generateContent({ model, contents, config });
+      const stream = await ai.models.generateContentStream({ model, contents, config });
+      let text = "";
+      for await (const chunk of stream) {
+        const piece = chunk.text;
+        if (!piece) continue;
+        streamed = true;
+        text += piece;
+        await emit({ type: "delta", text: piece });
+      }
+      if (text) return text;
+      const empty = "No response generated";
+      await emit({ type: "delta", text: empty });
+      return empty;
     } catch (error) {
       const isRetryable =
-        error instanceof ApiError && error.status === 503 && !config.abortSignal?.aborted;
+        !streamed &&
+        error instanceof ApiError &&
+        error.status === 503 &&
+        !config.abortSignal?.aborted;
       if (!isRetryable || attempt === MAX_ATTEMPTS) throw error;
       await new Promise((resolve) =>
         setTimeout(resolve, RETRY_DELAYS_MS[attempt - 1])
@@ -56,7 +91,7 @@ async function generateWithRetry(
     }
   }
   // Unreachable: the loop above always either returns or throws.
-  throw new Error("generateWithRetry: exhausted attempts without a result");
+  throw new Error("streamAnswer: exhausted attempts without a result");
 }
 
 // Never forward the client's generationConfig as-is: clamp every field to
@@ -223,106 +258,101 @@ interface ChatInput {
   ai: GoogleGenAI;
   model: string;
   messages: ChatMessage[];
-  docId: unknown;
+  docId: string | null | undefined;
   generationConfig: GenerateContentConfig;
   signal: AbortSignal;
+  emit: Emit;
 }
 
+// What LangSmith records; the browser gets the same content as it is produced.
 interface ChatResult {
-  status: number;
-  body: Record<string, unknown>;
+  text: string;
+  sources: SourceRef[];
+  docMissing?: boolean;
 }
 
 // One LangSmith trace per chat request; search (including the Python backend's
-// own runs) and each Gemini call nest under it.
+// own runs) and each Gemini call nest under it. The answer is streamed to the
+// browser through `emit` as it is generated, but this function only resolves
+// once the stream is finished, so the trace records the whole answer and the
+// true duration.
 const runChat = traceable(
-  async ({ ai, model, messages, docId, generationConfig, signal }: ChatInput): Promise<ChatResult> => {
-    // Returned so a thumbs up/down can be attached to this trace as feedback.
+  async ({ ai, model, messages, docId, generationConfig, signal, emit }: ChatInput): Promise<ChatResult> => {
+    // Sent to the browser so a thumbs up/down can be attached to this trace.
     const runId = currentRunId();
 
     const question = messages.at(-1)?.content ?? "";
     const history = recentHistory(messages.slice(0, -1));
 
-    // No document attached — existing behaviour.
+    // Answers that don't come from the model (search down, document gone…)
+    // are emitted in one piece so the client only handles one shape.
+    const sendFixedAnswer = async (text: string, extra: Record<string, unknown> = {}) => {
+      await emit({ type: "meta", runId, sources: [], ...extra });
+      await emit({ type: "delta", text });
+      return { text, sources: [], ...extra };
+    };
+
+    // No document attached — plain chat.
     if (docId === undefined || docId === null || docId === "") {
       const conversation: ChatMessage[] = [...history, { role: "user", content: question }];
-      const response = await generateWithRetry(ai, model, toContents(conversation), {
+      await emit({ type: "meta", runId, sources: [] });
+      const text = await streamAnswer(ai, model, toContents(conversation), {
         ...generationConfig,
         abortSignal: signal,
-      });
-      return {
-        status: 200,
-        body: { text: response.text || "No response generated", sources: [], runId },
-      };
-    }
-
-    if (typeof docId !== "string" || !DOC_ID_PATTERN.test(docId)) {
-      return { status: 400, body: { error: "Invalid document id" } };
+      }, emit);
+      return { text, sources: [] };
     }
 
     // Searched verbatim: an earlier LLM rewrite step turned complete questions
     // into worse queries (e.g. dropped the headquarters page out of the top 10).
     const chunks = await searchDocument({ query: question, docId, signal });
     if (chunks === null) {
-      return {
-        status: 200,
-        body: { text: "Document search is unavailable right now.", sources: [], runId },
-      };
+      return sendFixedAnswer("Document search is unavailable right now.");
     }
 
     // Filtering by doc_id with no matches at all means the document is gone
     // from the index, not that it lacks the answer.
     if (chunks.length === 0) {
-      return {
-        status: 200,
-        body: {
-          text: "That document is no longer available. Please re-upload it.",
-          sources: [],
-          docMissing: true,
-          runId,
-        },
-      };
+      return sendFixedAnswer("That document is no longer available. Please re-upload it.", {
+        docMissing: true,
+      });
     }
 
     const usable = chunks.filter((c) => c.score >= MIN_SCORE);
-    if (usable.length === 0) {
-      return { status: 200, body: { text: NO_ANSWER, sources: [], runId } };
-    }
+    if (usable.length === 0) return sendFixedAnswer(NO_ANSWER);
 
     const context = usable
       .map((c) => `[${c.filename}, page ${c.page}]\n${c.text}`)
       .join("\n\n---\n\n");
 
+    const sources = usable.map((c) => ({ filename: c.filename, page: c.page }));
+    await emit({ type: "meta", runId, sources });
+
     // The user's settings still apply, but grounding needs the system prompt
     // and temperature 0 so the answer stays faithful to the retrieved text.
-    const response = await generateWithRetry(
+    const text = await streamAnswer(
       ai,
       model,
       [
         ...toContents(history),
         { role: "user", parts: [{ text: `CONTEXT:\n${context}\n\nQUESTION: ${question}` }] },
       ],
-      { ...generationConfig, systemInstruction: GROUNDED, temperature: 0, abortSignal: signal }
+      { ...generationConfig, systemInstruction: GROUNDED, temperature: 0, abortSignal: signal },
+      emit
     );
 
-    const text = response.text || "No response generated";
-    // Citing pages under "I don't know" would imply they support an answer.
+    // Citing pages under "I don't know" would imply they support an answer, so
+    // they are withdrawn (the client replaces the sources it got in `meta`).
     const declined = /^["“]?I don['’]t know/.test(text.trim());
+    if (declined) await emit({ type: "meta", runId, sources: [] });
 
-    return {
-      status: 200,
-      body: {
-        text,
-        sources: declined ? [] : usable.map((c) => ({ filename: c.filename, page: c.page })),
-        runId,
-      },
-    };
+    return { text, sources: declined ? [] : sources };
   },
   {
     name: "chat",
     run_type: "chain",
     ...traceConfig,
-    // Never log `ai` (carries the Gemini API key) or the abort signal.
+    // Never log `ai` (carries the Gemini API key), the abort signal or `emit`.
     // LangSmith's trace list previews the first text field in alphabetical
     // order, which was `docId` for document questions. Keeping `input` as the
     // only top-level string (the rest nested under `settings`) makes the
@@ -333,10 +363,7 @@ const runChat = traceable(
       messages: messages.map(({ role, content }) => ({ role, content })),
       settings: { docId, model, generationConfig },
     }),
-    processOutputs: ({ status, body }) => {
-      const { text, error, runId: _runId, ...rest } = body;
-      return { output: text ?? error, status, ...rest };
-    },
+    processOutputs: ({ text, ...rest }) => ({ output: text, ...rest }),
   }
 );
 
@@ -346,46 +373,84 @@ export async function POST(request: NextRequest) {
   // to completion for nobody.
   const signal = request.signal;
   flushTracesAfterResponse();
+
+  // Everything that can fail before the answer starts is answered with plain
+  // JSON and a status code; once the stream opens the status is already 200,
+  // so later failures arrive as an `error` event instead.
+  let payload: {
+    messages?: unknown;
+    model?: unknown;
+    generationConfig?: unknown;
+    docId?: unknown;
+  };
   try {
-    const { messages, model, generationConfig, docId } = (await request.json()) as {
-      messages: ChatMessage[];
-      model?: unknown;
-      generationConfig?: unknown;
-      docId?: unknown;
-    };
-
-    const selectedModel =
-      typeof model === "string" && ALLOWED_MODELS.has(model)
-        ? model
-        : DEFAULT_MODEL;
-
-    const apiKey = process.env.GOOGLE_GENAI_API_KEY;
-    if (!apiKey) {
-      return NextResponse.json(
-        { error: "API key not configured" },
-        { status: 500 }
-      );
-    }
-
-    // Wrapped so every Gemini call (including failed retries) is recorded as an
-    // LLM run with its prompt, output and token usage.
-    const ai = wrapGemini(new GoogleGenAI({ apiKey }), traceConfig);
-
-    const { status, body } = await runChat({
-      ai,
-      model: selectedModel,
-      messages,
-      docId,
-      generationConfig: sanitizeGenerationConfig(generationConfig),
-      signal,
-    });
-    return NextResponse.json(body, { status });
-  } catch (error) {
-    // The client is gone; there's no one to send an error to.
-    if (signal.aborted) return new Response(null, { status: 499 });
-    console.error("Chat API error:", error);
-    const message =
-      error instanceof Error ? error.message : "Failed to generate response";
-    return NextResponse.json({ error: message }, { status: 500 });
+    payload = await request.json();
+  } catch {
+    return NextResponse.json({ error: "Invalid request body" }, { status: 400 });
   }
+
+  const { messages, model, generationConfig, docId } = payload;
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return NextResponse.json({ error: "No messages provided" }, { status: 400 });
+  }
+
+  const hasDoc = docId !== undefined && docId !== null && docId !== "";
+  if (hasDoc && (typeof docId !== "string" || !DOC_ID_PATTERN.test(docId))) {
+    return NextResponse.json({ error: "Invalid document id" }, { status: 400 });
+  }
+
+  const apiKey = process.env.GOOGLE_GENAI_API_KEY;
+  if (!apiKey) {
+    return NextResponse.json({ error: "API key not configured" }, { status: 500 });
+  }
+
+  const selectedModel =
+    typeof model === "string" && ALLOWED_MODELS.has(model) ? model : DEFAULT_MODEL;
+
+  // Wrapped so every Gemini call (including failed retries) is recorded as an
+  // LLM run with its prompt, output and token usage.
+  const ai = wrapGemini(new GoogleGenAI({ apiKey }), traceConfig);
+
+  const encoder = new TextEncoder();
+  const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
+  const writer = writable.getWriter();
+  const emit: Emit = async (event) => {
+    await writer.write(encoder.encode(`${JSON.stringify(event)}\n`));
+  };
+
+  // Deliberately not awaited: the response has to start flowing before the
+  // answer exists. The stream stays open until this finishes.
+  void (async () => {
+    try {
+      await runChat({
+        ai,
+        model: selectedModel,
+        messages: messages as ChatMessage[],
+        docId: hasDoc ? (docId as string) : null,
+        generationConfig: sanitizeGenerationConfig(generationConfig),
+        signal,
+        emit,
+      });
+    } catch (error) {
+      // An aborted request means the client is gone; a failed write means the
+      // same. Either way there is no one left to report the error to.
+      if (!signal.aborted) {
+        console.error("Chat API error:", error);
+        const message =
+          error instanceof Error ? error.message : "Failed to generate response";
+        await emit({ type: "error", error: message }).catch(() => {});
+      }
+    } finally {
+      await writer.close().catch(() => {});
+    }
+  })();
+
+  return new Response(readable, {
+    headers: {
+      "Content-Type": "application/x-ndjson; charset=utf-8",
+      "Cache-Control": "no-store, no-transform",
+      // Keeps proxies from buffering the response into one delivery.
+      "X-Accel-Buffering": "no",
+    },
+  });
 }
