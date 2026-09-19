@@ -1,8 +1,78 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+A [Next.js](https://nextjs.org) chat app powered by Google Gemini, with optional
+question answering over an uploaded PDF via a separate Python retrieval service.
 
 ## Architecture
 
-See [ARCHITECTURE.md](./ARCHITECTURE.md) for a diagram and request flow overview.
+```mermaid
+flowchart TD
+  U["User"]
+
+  subgraph browser["Browser (React client)"]
+    C["Chat.tsx<br/>chats, model picker, attach PDF,<br/>send/stop, copy/edit/regenerate"]
+    MS["ModelSettings.tsx<br/>temperature, top-K/P,<br/>output tokens, stop sequence, seed"]
+    MD["Markdown.tsx<br/>renders answers + sources"]
+  end
+
+  subgraph next["Next.js server (app/api)"]
+    CH["chat/route.ts<br/>allow-listed model, sanitised settings,<br/>last 6 messages, 503 retry, cancellable"]
+    UP["rag/upload/route.ts<br/>PDF proxy"]
+    FB["feedback/route.ts<br/>thumbs up/down"]
+    TR["lib/tracing.ts<br/>LangSmith client + trace headers"]
+  end
+
+  subgraph py["Python service (FastAPI, RAG_HOMEWORK)"]
+    SE["POST /search<br/>hybrid retrieval"]
+    IN["POST /upload<br/>parse, embed, index"]
+  end
+
+  subgraph ext["External services"]
+    GEM["Gemini API"]
+    OAI["OpenAI embeddings"]
+    PC["Pinecone index"]
+    LS["LangSmith"]
+  end
+
+  CSV[("feedback.csv")]
+
+  U --> C
+  C --> MS
+  C --> MD
+  C -->|"POST /api/chat"| CH
+  C -->|"POST /api/rag/upload"| UP
+  C -->|"POST /api/feedback"| FB
+
+  CH -->|"question + document id"| SE
+  CH -->|"chat, or retrieved pages + question"| GEM
+  UP -->|"PDF bytes"| IN
+  FB --> CSV
+  FB -->|"rating on the trace"| LS
+
+  SE --> OAI
+  SE --> PC
+  IN --> OAI
+  IN --> PC
+
+  CH -.-> TR
+  UP -.-> TR
+  TR -.->|"traces"| LS
+  SE -.->|"nested runs"| LS
+  IN -.-> LS
+```
+
+**Plain chat:** the browser posts the conversation to `/api/chat`, which calls Gemini
+and returns the reply.
+
+**Document question:** `/api/chat` sends the question verbatim to the Python service,
+which embeds it and searches Pinecone; the top pages are passed to Gemini as context,
+and the answer comes back with the page numbers it cites.
+
+**Upload:** the PDF is proxied to the Python service, which extracts the text per page,
+embeds it and upserts it into Pinecone.
+
+**Tracing:** when a LangSmith key is set, each request is one trace; the Python
+service's steps nest inside it, and 👍/👎 is recorded on the trace.
+
+See [ARCHITECTURE.md](./ARCHITECTURE.md) for the request flow and file-by-file notes.
 
 ## Getting Started
 

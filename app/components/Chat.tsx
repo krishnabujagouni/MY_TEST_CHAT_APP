@@ -15,9 +15,20 @@ import {
   ThumbsDown,
   RotateCw,
   ChevronDown,
+  SlidersHorizontal,
+  Paperclip,
+  FileText,
+  LoaderCircle,
+  Square,
+  ArrowUp,
 } from "lucide-react";
 import Markdown from "./Markdown";
-import type { Message, Conversation } from "./types";
+import ModelSettings, {
+  DEFAULT_GENERATION_SETTINGS,
+  buildGenerationConfigPayload,
+  type GenerationSettings,
+} from "./ModelSettings";
+import type { Message, Conversation, Source, AttachedDocument } from "./types";
 
 interface GeminiModel {
   id: string;
@@ -44,7 +55,9 @@ const DEFAULT_MODEL_ID = MODELS[1].id;
 
 const createMessage = (
   role: Message["role"],
-  content: string
+  content: string,
+  sources: Source[] = [],
+  runId?: string
 ): Message => ({
   id:
     typeof crypto !== "undefined" && "randomUUID" in crypto
@@ -53,7 +66,15 @@ const createMessage = (
   role,
   content,
   feedback: null,
+  sources,
+  runId,
 });
+
+// The same page is often retrieved more than once; list it once.
+const uniqueSources = (sources: Source[]) =>
+  sources.filter(
+    (s, i) => sources.findIndex((o) => o.filename === s.filename && o.page === s.page) === i
+  );
 
 export default function Chat() {
   const [conversations, setConversations] = useState<Conversation[]>([]);
@@ -66,8 +87,17 @@ export default function Chat() {
   const [editText, setEditText] = useState("");
   const [model, setModel] = useState(DEFAULT_MODEL_ID);
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
+  const [generationSettings, setGenerationSettings] = useState<GenerationSettings>(
+    DEFAULT_GENERATION_SETTINGS
+  );
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [attachedDoc, setAttachedDoc] = useState<AttachedDocument | null>(null);
+  const [uploading, setUploading] = useState(false);
+  const [uploadError, setUploadError] = useState<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const modelMenuRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
 
   const currentConv = conversations.find((c) => c.id === currentConvId);
   const messages = currentConv?.messages || [];
@@ -98,28 +128,62 @@ export default function Chat() {
     setCurrentConvId(newId);
   };
 
+  const stopGenerating = () => abortControllerRef.current?.abort();
+
   // Sends `history` (the full message list to send as context) to the API
-  // and returns the assistant's reply as a Message. Never throws.
-  const fetchAssistantReply = async (history: Message[]): Promise<Message> => {
+  // and returns the assistant's reply as a Message, or null if the user
+  // stopped it. Never throws.
+  const fetchAssistantReply = async (history: Message[]): Promise<Message | null> => {
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
     try {
       const response = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ messages: history, model }),
+        body: JSON.stringify({
+          messages: history,
+          model,
+          generationConfig: buildGenerationConfigPayload(generationSettings),
+          docId: attachedDoc?.docId,
+        }),
+        signal: controller.signal,
       });
 
       const data = await response.json();
       if (!response.ok) {
         throw new Error(data.error || "Failed to fetch response");
       }
-      return createMessage("assistant", data.text);
+      if (data.docMissing) setAttachedDoc(null);
+      return createMessage("assistant", data.text, data.sources ?? [], data.runId);
     } catch (error) {
+      if (controller.signal.aborted) return null;
       console.error("Error:", error);
       const detail = error instanceof Error ? error.message : String(error);
       return createMessage(
         "assistant",
         `Sorry, I encountered an error: ${detail}`
       );
+    } finally {
+      if (abortControllerRef.current === controller) abortControllerRef.current = null;
+    }
+  };
+
+  const handleUpload = async (file: File) => {
+    setUploading(true);
+    setUploadError(null);
+    try {
+      const form = new FormData();
+      form.append("file", file);
+      const response = await fetch("/api/rag/upload", { method: "POST", body: form });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Upload failed");
+      setAttachedDoc({ docId: data.doc_id, filename: data.filename, pages: data.pages });
+    } catch (error) {
+      setUploadError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setUploading(false);
+      // Clear so picking the same file again still fires onChange.
+      if (fileInputRef.current) fileInputRef.current.value = "";
     }
   };
 
@@ -150,13 +214,15 @@ export default function Chat() {
 
     const assistantMessage = await fetchAssistantReply(history);
 
-    setConversations((prev) =>
-      prev.map((c) =>
-        c.id === convId
-          ? { ...c, messages: [...history, assistantMessage] }
-          : c
-      )
-    );
+    if (assistantMessage) {
+      setConversations((prev) =>
+        prev.map((c) =>
+          c.id === convId
+            ? { ...c, messages: [...history, assistantMessage] }
+            : c
+        )
+      );
+    }
 
     if (priorMessages.length === 0) {
       const title =
@@ -218,6 +284,7 @@ export default function Chat() {
         prompt: promptMessage?.content ?? "",
         response: message.content,
         feedback: newFeedback,
+        runId: message.runId,
       }),
     }).catch((error) => console.error("Failed to save feedback:", error));
   };
@@ -235,13 +302,15 @@ export default function Chat() {
 
     const assistantMessage = await fetchAssistantReply(history);
 
-    setConversations((prev) =>
-      prev.map((c) =>
-        c.id === currentConvId
-          ? { ...c, messages: [...history, assistantMessage] }
-          : c
-      )
-    );
+    if (assistantMessage) {
+      setConversations((prev) =>
+        prev.map((c) =>
+          c.id === currentConvId
+            ? { ...c, messages: [...history, assistantMessage] }
+            : c
+        )
+      );
+    }
     setLoading(false);
   };
 
@@ -272,13 +341,15 @@ export default function Chat() {
 
     const assistantMessage = await fetchAssistantReply(history);
 
-    setConversations((prev) =>
-      prev.map((c) =>
-        c.id === currentConvId
-          ? { ...c, messages: [...history, assistantMessage] }
-          : c
-      )
-    );
+    if (assistantMessage) {
+      setConversations((prev) =>
+        prev.map((c) =>
+          c.id === currentConvId
+            ? { ...c, messages: [...history, assistantMessage] }
+            : c
+        )
+      );
+    }
     setLoading(false);
   };
 
@@ -391,6 +462,14 @@ export default function Chat() {
                   </div>
                 )}
               </div>
+
+              <button
+                onClick={() => setSettingsOpen(true)}
+                title="Model settings"
+                className="p-2 hover:bg-gray-100 rounded-lg transition-colors"
+              >
+                <SlidersHorizontal size={18} className="text-gray-700" />
+              </button>
             </div>
           </div>
         </div>
@@ -476,6 +555,20 @@ export default function Chat() {
                         ) : (
                           <div className="text-gray-900">
                             <Markdown content={msg.content} />
+                            {msg.sources && msg.sources.length > 0 && (
+                              <div className="mt-3 flex flex-wrap items-center gap-1.5">
+                                <span className="text-xs text-gray-500">Sources:</span>
+                                {uniqueSources(msg.sources).map((s) => (
+                                  <span
+                                    key={`${s.filename}-${s.page}`}
+                                    className="inline-flex items-center gap-1 rounded-full border border-gray-200 bg-white px-2 py-0.5 text-xs text-gray-700"
+                                  >
+                                    <FileText size={12} />
+                                    {s.filename}, p. {s.page}
+                                  </span>
+                                ))}
+                              </div>
+                            )}
                           </div>
                         )}
 
@@ -571,26 +664,95 @@ export default function Chat() {
         {/* Input */}
         <div className="bg-white bg-opacity-80 backdrop-blur-sm border-t border-gray-200 py-4">
           <div className="max-w-4xl mx-auto px-4">
+            {(attachedDoc || uploading || uploadError) && (
+              <div className="mb-2 flex flex-wrap items-center gap-2 text-sm">
+                {uploading && (
+                  <span className="inline-flex items-center gap-1.5 rounded-full bg-gray-100 px-3 py-1 text-gray-600">
+                    <LoaderCircle size={14} className="animate-spin" />
+                    Uploading and indexing…
+                  </span>
+                )}
+                {attachedDoc && !uploading && (
+                  <span className="inline-flex items-center gap-1.5 rounded-full bg-blue-50 px-3 py-1 text-blue-800">
+                    <FileText size={14} />
+                    {attachedDoc.filename}
+                    <span className="text-blue-600/70">· {attachedDoc.pages} pages</span>
+                    <button
+                      type="button"
+                      onClick={() => setAttachedDoc(null)}
+                      title="Remove document"
+                      className="ml-0.5 rounded-full p-0.5 hover:bg-blue-100"
+                    >
+                      <X size={12} />
+                    </button>
+                  </span>
+                )}
+                {uploadError && !uploading && (
+                  <span className="text-red-600">{uploadError}</span>
+                )}
+              </div>
+            )}
             <form onSubmit={handleSubmit} className="flex gap-3">
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="application/pdf,.pdf"
+                className="hidden"
+                onChange={(e) => {
+                  const file = e.target.files?.[0];
+                  if (file) handleUpload(file);
+                }}
+              />
+              <button
+                type="button"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={uploading || loading}
+                title="Attach a PDF"
+                className="p-3 rounded-full border border-gray-300 bg-white text-gray-600 hover:bg-gray-50 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+              >
+                <Paperclip size={20} />
+              </button>
               <input
                 type="text"
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
-                placeholder="Message Gemini"
+                placeholder={attachedDoc ? `Ask about ${attachedDoc.filename}` : "Message Gemini"}
                 disabled={loading}
                 className="flex-1 px-4 py-3 border border-gray-300 rounded-full focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent placeholder-gray-500 disabled:bg-gray-50 disabled:cursor-not-allowed transition-all bg-white text-gray-900"
               />
-              <button
-                type="submit"
-                disabled={loading || !input.trim()}
-                className="px-6 py-3 bg-blue-600 text-white rounded-full hover:bg-blue-700 disabled:bg-gray-300 disabled:cursor-not-allowed transition-colors font-medium"
-              >
-                Send
-              </button>
+              {/* One button in one place: send (arrow) when idle, stop (square) while a reply generates. */}
+              {loading ? (
+                <button
+                  type="button"
+                  onClick={stopGenerating}
+                  title="Stop generating"
+                  aria-label="Stop generating"
+                  className="flex h-12 w-12 flex-shrink-0 items-center justify-center rounded-full bg-gray-900 text-white hover:bg-gray-700 transition-colors"
+                >
+                  <Square size={14} fill="currentColor" />
+                </button>
+              ) : (
+                <button
+                  type="submit"
+                  disabled={!input.trim()}
+                  title="Send message"
+                  aria-label="Send message"
+                  className="flex h-12 w-12 flex-shrink-0 items-center justify-center rounded-full bg-blue-600 text-white hover:bg-blue-700 disabled:bg-gray-300 disabled:cursor-not-allowed transition-colors"
+                >
+                  <ArrowUp size={20} strokeWidth={2.5} />
+                </button>
+              )}
             </form>
           </div>
         </div>
       </div>
+
+      <ModelSettings
+        open={settingsOpen}
+        settings={generationSettings}
+        onChange={setGenerationSettings}
+        onClose={() => setSettingsOpen(false)}
+      />
     </div>
   );
 }

@@ -1,6 +1,46 @@
-import { NextRequest, NextResponse } from "next/server";
+import { NextRequest, NextResponse, after } from "next/server";
 import { promises as fs } from "fs";
 import path from "path";
+import { langsmith, tracingEnabled } from "@/app/lib/tracing";
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// LangSmith is deprecating run feedback without the project (session) id, so
+// it's looked up once per server process and reused.
+let projectIdPromise: Promise<string> | null = null;
+function tracingProjectId(): Promise<string> {
+  projectIdPromise ??= langsmith
+    .readProject({ projectName: process.env.LANGSMITH_PROJECT || "default" })
+    .then((project) => project.id)
+    .catch((error) => {
+      projectIdPromise = null; // e.g. the project doesn't exist yet; retry next time
+      throw error;
+    });
+  return projectIdPromise;
+}
+
+// The run's own id doubles as the feedback id, so re-rating a reply updates
+// its single "user_rating" in LangSmith instead of stacking up new ones —
+// the same one-rating-per-reply rule the CSV follows.
+async function recordRunFeedback(runId: string, feedback: "up" | "down") {
+  const score = feedback === "up" ? 1 : 0;
+  try {
+    await langsmith.createFeedback({
+      runId,
+      sessionId: await tracingProjectId(),
+      key: "user_rating",
+      score,
+      feedbackId: runId,
+      feedbackSourceType: "app",
+    });
+  } catch {
+    try {
+      await langsmith.updateFeedback(runId, { score });
+    } catch (error) {
+      console.error("LangSmith feedback failed:", error);
+    }
+  }
+}
 
 export const runtime = "nodejs";
 
@@ -107,7 +147,7 @@ async function writeRows(rows: FeedbackRow[]): Promise<void> {
 
 export async function POST(request: NextRequest) {
   try {
-    const { prompt, response, feedback } = await request.json();
+    const { prompt, response, feedback, runId } = await request.json();
 
     if (
       typeof prompt !== "string" ||
@@ -134,6 +174,10 @@ export async function POST(request: NextRequest) {
     }
 
     await writeRows(rows);
+
+    if (tracingEnabled && typeof runId === "string" && UUID_PATTERN.test(runId)) {
+      after(() => recordRunFeedback(runId, feedback));
+    }
 
     return NextResponse.json({ ok: true });
   } catch (error) {
