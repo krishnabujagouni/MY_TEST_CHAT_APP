@@ -10,61 +10,31 @@ from a separate Python (FastAPI) service backed by Pinecone.
 
 ## Diagram
 
+Solid arrows are the request path; dotted arrows are tracing.
+
 ```mermaid
-flowchart TD
-  U["User"]
+flowchart LR
+  U(["User"]) --> UI["Chat UI<br/>in the browser"]
 
-  subgraph browser["Browser (React client)"]
-    C["Chat.tsx<br/>chats, model picker, attach PDF,<br/>send/stop, copy/edit/regenerate"]
-    MS["ModelSettings.tsx<br/>temperature, top-K/P,<br/>output tokens, stop sequence, seed"]
-    MD["Markdown.tsx<br/>renders answers + sources"]
-  end
+  UI -->|"question"| CHAT["/api/chat"]
+  UI -->|"PDF"| UPLOAD["/api/rag/upload"]
+  UI -->|"thumbs up / down"| FEED["/api/feedback"]
 
-  subgraph next["Next.js server (app/api)"]
-    CH["chat/route.ts"]
-    UP["rag/upload/route.ts"]
-    FB["feedback/route.ts"]
-    TR["lib/tracing.ts"]
-  end
+  CHAT -->|"1. find relevant pages"| PY["Python service<br/>FastAPI"]
+  CHAT -->|"2. pages + question"| GEM["Gemini<br/>writes the answer"]
+  UPLOAD -->|"index the document"| PY
+  FEED --> CSV[("feedback.csv")]
 
-  subgraph py["Python service (FastAPI, RAG_HOMEWORK)"]
-    SE["POST /search"]
-    IN["POST /upload"]
-    ST["store.py<br/>ingest_pdf, hybrid search"]
-  end
+  PY -->|"turn text into vectors"| OAI["OpenAI<br/>embeddings"]
+  PY -->|"store / search vectors"| PC[("Pinecone<br/>vector index")]
 
-  subgraph ext["External services"]
-    GEM["Gemini API"]
-    OAI["OpenAI embeddings"]
-    PC["Pinecone index"]
-    LS["LangSmith"]
-  end
-
-  CSV[("feedback.csv")]
-
-  U --> C
-  C --> MS
-  C --> MD
-  C -->|"POST /api/chat"| CH
-  C -->|"POST /api/rag/upload"| UP
-  C -->|"POST /api/feedback"| FB
-
-  CH -->|"question + document id"| SE
-  CH -->|"chat, or retrieved pages + question"| GEM
-  UP -->|"PDF bytes"| IN
-  FB --> CSV
-  FB -->|"rating on the trace"| LS
-
-  SE --> ST
-  IN --> ST
-  ST --> OAI
-  ST --> PC
-
-  CH -.-> TR
-  UP -.-> TR
-  TR -.->|"traces"| LS
-  ST -.->|"nested runs"| LS
+  CHAT -.-> LS["LangSmith<br/>traces"]
+  UPLOAD -.-> LS
+  FEED -.->|"rating"| LS
+  PY -.->|"nested steps"| LS
 ```
+
+Without a PDF attached, `/api/chat` skips step 1 and asks Gemini directly.
 
 ## Request Flow
 
